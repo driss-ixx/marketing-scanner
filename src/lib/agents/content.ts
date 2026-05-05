@@ -48,16 +48,18 @@ export function summarizeSiteForPrompt(site: ScrapedSite): string {
 
 export function buildJsonSchemaInstruction(category: Category): string {
   return [
-    "You MUST return ONLY a single valid JSON object — no prose, no markdown fences.",
-    "Schema:",
+    "LANGUE DE SORTIE: tous les champs textuels (strengths, weaknesses, findings.title, findings.description, recommendations.title, recommendations.description, recommendations.timeline, summary) DOIVENT être rédigés en FRANÇAIS, peu importe la langue du site analysé.",
+    "",
+    "Tu DOIS retourner UNIQUEMENT un objet JSON valide — aucun texte avant ou après, aucun bloc markdown ```json.",
+    "Schéma strict :",
     "{",
     `  "category": "${category}",`,
-    '  "score": <integer 0-100>,',
-    '  "strengths": [<string>],',
-    '  "weaknesses": [<string>],',
-    '  "findings": [ { "title": <string>, "severity": "critical"|"high"|"medium"|"low", "description": <string>, "evidence": <string> } ],',
-    '  "recommendations": [ { "priority": "quick_win"|"strategic"|"long_term", "title": <string>, "description": <string>, "impact_estimate_min": <number EUR/month>, "impact_estimate_max": <number EUR/month>, "timeline": <string>, "confidence": "high"|"medium"|"low" } ],',
-    '  "summary": <2-3 sentence string>',
+    '  "score": <entier 0-100>,',
+    '  "strengths": [<string en français>],',
+    '  "weaknesses": [<string en français>],',
+    '  "findings": [ { "title": <string FR>, "severity": "critical"|"high"|"medium"|"low", "description": <string FR>, "evidence": <citation verbatim du site, peut rester dans la langue d\'origine> } ],',
+    '  "recommendations": [ { "priority": "quick_win"|"strategic"|"long_term", "title": <string FR>, "description": <string FR>, "impact_estimate_min": <number EUR/mois>, "impact_estimate_max": <number EUR/mois>, "timeline": <string FR ex "1 semaine">, "confidence": "high"|"medium"|"low" } ],',
+    '  "summary": <2-3 phrases en français>',
     "}",
   ].join("\n");
 }
@@ -165,15 +167,13 @@ export async function runAgentWithProviders(
 
   const results: AgentResult[] = [];
   for (const p of providers) {
-    const resp = await callLlm({
-      provider: p.provider,
-      model: p.model,
-      system: systemPrompt,
-      user: userPrompt,
-      temperature: 0.2,
-      max_tokens: 3000,
-    });
-    results.push(tryParseAgentResult(resp.content, category));
+    const result = await callWithRetry(
+      p,
+      category,
+      systemPrompt,
+      userPrompt
+    );
+    results.push(result);
   }
 
   if (results.length === 1) return results[0];
@@ -208,6 +208,72 @@ export async function runAgentWithProviders(
     summary: results.map((r) => r.summary).join(" "),
   };
   return merged;
+}
+
+/**
+ * Call LLM with retry on parse failure. First attempt: full prompt @ temp 0.2.
+ * Second attempt (on parse fail or empty result): same prompt + strict reminder
+ * @ temp 0. Third attempt: minimal stub result if still failing (no throw — the
+ * synthesizer treats missing categories as 0).
+ */
+async function callWithRetry(
+  p: ProviderChoice,
+  category: Category,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<AgentResult> {
+  // Attempt 1
+  try {
+    const resp = await callLlm({
+      provider: p.provider,
+      model: p.model,
+      system: systemPrompt,
+      user: userPrompt,
+      temperature: 0.2,
+      max_tokens: 3000,
+    });
+    const parsed = tryParseAgentResult(resp.content, category);
+    if (parsed.score > 0 || parsed.findings.length > 0 || parsed.recommendations.length > 0) {
+      return parsed;
+    }
+    // Empty result — fall through to retry
+    console.warn(`[agent:${category}] empty result on attempt 1, retrying...`);
+  } catch (err) {
+    console.warn(
+      `[agent:${category}] attempt 1 failed (${(err as Error).message.slice(0, 120)}), retrying...`
+    );
+  }
+
+  // Attempt 2: stricter prompt, temperature 0
+  try {
+    const stricterSystem =
+      systemPrompt +
+      "\n\nRAPPEL CRITIQUE : Ta réponse DOIT commencer par '{' et finir par '}'. Aucun texte avant ou après. Aucun ```json. Si tu ne respectes pas ce format, le système plante.";
+    const resp = await callLlm({
+      provider: p.provider,
+      model: p.model,
+      system: stricterSystem,
+      user: userPrompt,
+      temperature: 0,
+      max_tokens: 3000,
+    });
+    return tryParseAgentResult(resp.content, category);
+  } catch (err) {
+    console.error(
+      `[agent:${category}] BOTH attempts failed for ${p.provider}:${p.model} — falling back to stub. Last err: ${(err as Error).message.slice(0, 200)}`
+    );
+    // Stub result so the audit pipeline doesn't completely fail. The category
+    // gets a 0 score and a single explanatory finding.
+    return {
+      category,
+      score: 0,
+      strengths: [],
+      weaknesses: [`L'agent ${category} n'a pas pu produire de résultat exploitable (LLM ${p.provider}:${p.model}).`],
+      findings: [],
+      recommendations: [],
+      summary: `Catégorie ${category} non évaluée — relancez l'audit ou passez en tier supérieur.`,
+    };
+  }
 }
 
 function dedupe(arr: string[]): string[] {
